@@ -7,12 +7,11 @@ from datetime import datetime, timedelta
 import os
 from dotenv import load_dotenv
 import pandas as pd
-from threading import Thread  # Removed in adjustments
 import joblib
 import numpy as np
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier  # Not used in current training
 from sklearn.metrics import classification_report
+from xgboost import XGBClassifier  # Ensure XGBClassifier is imported
 from src.data_preprocessing import load_data, preprocess_data
 from src.model_training import train_model
 from src.inference import predict_room
@@ -49,7 +48,17 @@ AREAS = [
     "office", "front_porch", "driveway",
     "nova_s_room", "christian_s_room", "sky_floor", "master_bathroom",
     "backyard", "dining_room",
-    "laundry_room", "dressing_room",
+    "laundry_room", "dressing_room", "bathroom"
+]
+
+BLE_DEVICES = [
+    "master_bedroom",
+    "master_bathroom",
+    "lounge",
+    "kitchen",
+    "office",
+    "sky_floor",
+    "balcony"
 ]
 
 # Log file paths
@@ -325,10 +334,10 @@ async def monitor_light_events(logger):
                     event = json.loads(message)
                     if event.get("type") == "event" and event["event"].get("event_type") == "state_changed":
                         entity_id = event["event"]["data"]["entity_id"]
-                        if entity_id.startswith("light."):
-                            new_state = event["event"]["data"]["new_state"]
-                            old_state = event["event"]["data"]["old_state"]
+                        new_state = event["event"]["data"]["new_state"]
+                        old_state = event["event"]["data"]["old_state"]
 
+                        if entity_id.startswith("light."):
                             if new_state["state"] != old_state["state"]:
                                 action = "turned_on" if new_state["state"] == "on" else "turned_off"
                                 asyncio.create_task(log_manual_light_event(logger, entity_id, action))  # Asynchronous logging
@@ -343,21 +352,21 @@ async def monitor_light_events(logger):
 # Define floor and section BLE data
 FLOOR_MAP = {
     "first_floor": {
-        "front": ["lounge_ble", "master_bedroom_ble"],
-        "middle": ["bathroom_ble", "dining_room", "lounge_ble"],
-        "back": ["kitchen_ble", "backyard_ble", "garage_ble", "laundry_room_ble"] 
+        "front": ["front_porch", "master_bedroom", "nova_s_room", "bathroom"],
+        "middle": ["master_bathroom", "dining_room", "lounge", "driveway"],
+        "back": ["kitchen", "backyard", "garage"]
     },
     "second_floor": {
-        "front": ["dressing_room_ble"],
-        "middle": ["office_ble", "sky_floor_ble"],
-        "back": ["balcony_ble"]
+        "front": ["dressing_room"],
+        "middle": ["office", "sky_floor"],
+        "back": ["balcony"]
     }
 }
 
 def determine_floor_and_section(room):
     for floor, sections in FLOOR_MAP.items():
-        for section, devices in sections.items():
-            if f"{room}_ble" in devices:
+        for section, rooms in sections.items():
+            if room in rooms:
                 return floor, section
     return None, None
 
@@ -375,7 +384,7 @@ async def log_location(logger, device, room, action):
     except Exception as e:
         await logger.error(f"Failed to write log entry: {e}")
 
-# Define the missing is_room_overridden function
+# Function to check if a room is currently overridden
 def is_room_overridden(room):
     # Check override_timers dictionary
     current_time = time.time()
@@ -440,27 +449,18 @@ async def log_override_event(logger, room, light_entity_id, user=None):
         await logger.error(f"Failed to log override event: {e}")
 
 # Function to set override
-def set_override(room):
+def set_override(room, logger):
     override_end_time = time.time() + override_duration
     override_timers[room] = {'end_time': override_end_time}
-    loop = asyncio.get_event_loop()
     # Schedule the reset_override coroutine
-    loop.create_task(reset_override_wrapper(room))
-
-# Async function to wrap reset_override for scheduling
-async def reset_override_wrapper(room):
-    await asyncio.sleep(override_duration)
-    await reset_override(room)
+    loop = asyncio.get_event_loop()
+    loop.create_task(reset_override(logger, room))
 
 # Async function to reset override
-async def reset_override(room):
+async def reset_override(logger, room):
+    await asyncio.sleep(override_duration)
     override_timers.pop(room, None)
-    # Assuming logger is globally accessible or passed appropriately
-    # Here, you might need to adjust how you pass logger
-    # For this example, we'll pass logger as a parameter
-    # To implement properly, consider refactoring the override system to have access to logger
-    # This is a placeholder
-    pass  # Implement logging if necessary
+    await logger.info(f"Override for room {room} has been reset.")
 
 # Async function to cleanup old data
 async def cleanup_old_data(logger, retention_days=30):
@@ -602,11 +602,11 @@ async def monitor_overrides(logger):
                                 if old_state == "on" and new_state == "off":
                                     await logger.info(f"Manual override detected for {light_entity_id}")
                                     await log_override_event(logger, room=area, light_entity_id=light_entity_id)
-                                    set_override(area)
+                                    set_override(area, logger)
                                 elif old_state == "off" and new_state == "on":
                                     await logger.info(f"Manual override turned on for {light_entity_id}")
                                     await log_override_event(logger, room=area, light_entity_id=light_entity_id, user="manual_on")
-                                    set_override(area)
+                                    set_override(area, logger)
         except Exception as e:
             await logger.error(f"An error occurred during override monitoring with {ws_url}: {e}")
             await logger.debug(traceback.format_exc())
@@ -634,6 +634,7 @@ async def monitor_room_location(logger, model):
             model_loaded = True
         except Exception as e:
             await logger.error(f"Error loading model: {e}")
+            model = None
     else:
         model = None
         await logger.warning("Model file not found. Real-time predictions will not be available.")
@@ -741,6 +742,7 @@ def prepare_features(sensor_data, device, areas):
     features['device_id'] = device_idx
 
     # Ensure all feature_names are present
+    # Assuming feature order: ['hour', 'day_of_week'] + ['distance_to_<area>'] + ['device_id']
     feature_values = [features.get(name, 0) for name in ['hour', 'day_of_week'] + [f"distance_to_{area}" for area in areas] + ['device_id']]
 
     return np.array(feature_values).reshape(1, -1)  # Reshape for prediction
@@ -764,16 +766,16 @@ async def start_health_server(logger):
 
 # Main application logic
 async def main():
-    # Initialize aiologger without handlers
+    # Initialize aiologger with asynchronous handlers
     logger = Logger.with_default_handlers(name='ai_agent')
 
     # Create and add file handler (asynchronous)
     file_handler = AsyncFileHandler(ai_agent_log_file)
-    await logger.add_handler(file_handler)  # Use await since it's asynchronous
+    await logger.add_handler(file_handler)
 
     # Create and add stream handler (logs to STDOUT) (asynchronous)
     stream_handler = AsyncStreamHandler()
-    await logger.add_handler(stream_handler)  # Use await since it's asynchronous
+    await logger.add_handler(stream_handler)
 
     try:
         # Initialize CSV file
