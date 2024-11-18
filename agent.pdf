@@ -1,0 +1,525 @@
+import asyncio
+import json
+import websockets
+import requests
+import time
+from datetime import datetime, timedelta
+import os
+from dotenv import load_dotenv
+import logging
+import pandas as pd
+from threading import Thread
+import joblib
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report
+import traceback
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,  # Change to logging.DEBUG for more detailed logs
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("/app/data/ai_agent.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Configuration from environment variables
+HOME_ASSISTANT_WS_URL = os.getenv("HOME_ASSISTANT_WS_URL")
+HOME_ASSISTANT_WSS_URL = os.getenv("HOME_ASSISTANT_WSS_URL")
+HOME_ASSISTANT_API_URL = os.getenv("HOME_ASSISTANT_API_URL")
+HOME_ASSISTANT_CLOUD_API_URL = os.getenv("HOME_ASSISTANT_CLOUD_API_URL")
+LONG_LIVED_ACCESS_TOKEN = os.getenv("HA_LONG_LIVED_ACCESS_TOKEN")
+
+if not LONG_LIVED_ACCESS_TOKEN:
+    logger.error("Home Assistant Long-Lived Access Token not set.")
+    raise ValueError("Home Assistant Long-Lived Access Token not set.")
+
+# Headers for REST API calls
+HEADERS = {
+    "Authorization": f"Bearer {LONG_LIVED_ACCESS_TOKEN}",
+    "content-type": "application/json",
+}
+
+# Define the device names and areas
+DEVICE_NAMES = ["madisons_iphone", "bkam_iphone", "nova_iphone", "bkam_apple_watch"]
+AREAS = [
+    "lounge", "master_bedroom", "kitchen", "balcony", "garage", "office",
+    "sky_floor", "master_bathroom", "backyard", "front_porch", "dining_room", "laundry_room"
+]
+
+# Map areas to BLE sensors and actions
+AREA_BLE_SENSORS = {area: f"sensor.{area}_ble" for area in AREAS}
+AREA_ACTIONS = {
+    area: {
+        "enter": [("light", "turn_on", {"entity_id": f"light.{area}_lights"})],
+        "exit": [("light", "turn_off", {"entity_id": f"light.{area}_lights"})],
+    } for area in AREAS
+}
+# Special case for 'sky_floor'
+AREA_ACTIONS["sky_floor"]["enter"].extend([
+    ("light", "turn_on", {"entity_id": "light.sky_bed_light"})
+])
+AREA_ACTIONS["sky_floor"]["exit"].extend([
+    ("light", "turn_off", {"entity_id": "light.sky_bed_light"})
+])
+
+# Define maximum distance and minimum required sensors
+MAX_DISTANCE = 20  # Adjust based on maximum expected distance
+MIN_REQUIRED_SENSORS = 2  # Minimum number of sensors required to make a prediction
+
+# Global state
+current_rooms = {}
+last_action_time = {}
+override_timers = {}  # Stores override timers for rooms
+
+# Data collection
+data_log_file = "/app/data/sensor_data.csv"
+override_log_file = "/app/data/override_log.csv"  # Log file for overrides
+data_analysis_interval = 900  # Analyze data every 15 minutes
+
+# Debounce settings
+min_time_between_actions = 10  # Minimum time between actions per device
+override_duration = 600  # Override duration in seconds (e.g., 10 minutes)
+
+def call_service(domain, service, service_data):
+    for api_url in [HOME_ASSISTANT_API_URL, HOME_ASSISTANT_CLOUD_API_URL]:
+        url = f"{api_url}/services/{domain}/{service}"
+        try:
+            response = requests.post(url, headers=HEADERS, json=service_data, timeout=5)
+            if response.status_code == 200:
+                logger.info(f"Called service {domain}.{service} with {service_data} using {api_url}")
+                return
+            else:
+                logger.error(f"Failed to call service {domain}.{service} using {api_url}: {response.text}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error calling service {domain}.{service} using {api_url}: {e}")
+    logger.error(f"All attempts to call service {domain}.{service} failed.")
+
+def log_location(device, room, action):
+    timestamp = datetime.now().isoformat()
+    log_entry = {"timestamp": timestamp, "device": device, "room": room, "action": action}
+    log_dir = "/app/data"
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, "location_log.json")
+    try:
+        with open(log_file, "a") as logfile:
+            logfile.write(json.dumps(log_entry) + "\n")
+        logger.debug(f"Logged location: {log_entry}")
+    except Exception as e:
+        logger.error(f"Failed to write log entry: {e}")
+
+def handle_room_change(device, room, action_type):
+    current_time = time.time()
+    if last_action_time.get(device, 0) + min_time_between_actions > current_time:
+        logger.debug(f"Skipping action for {device} {action_type}ing {room} due to debounce.")
+        return
+
+    # Check for override
+    if is_room_overridden(room):
+        logger.info(f"Room {room} is currently overridden. Skipping {action_type} actions.")
+        return
+
+    logger.info(f"{device} {action_type}ing room: {room}")
+    actions = AREA_ACTIONS.get(room, {}).get(action_type, [])
+    for domain, service, service_data in actions:
+        call_service(domain, service, service_data)
+    log_location(device, room, action_type)
+    last_action_time[device] = current_time
+
+def is_room_overridden(room):
+    """Check if the room is currently in override mode."""
+    override_info = override_timers.get(room)
+    if override_info:
+        override_end_time = override_info['end_time']
+        if time.time() < override_end_time:
+            return True
+        else:
+            # Override expired
+            override_timers.pop(room, None)
+    return False
+
+def log_override_event(room, light_entity_id, user=None):
+    timestamp = datetime.now().isoformat()
+    override_entry = {
+        "timestamp": timestamp,
+        "room": room,
+        "light_entity_id": light_entity_id,
+        "user": user or "unknown",
+        "hour": datetime.now().hour,
+        "day_of_week": datetime.now().weekday(),
+    }
+    try:
+        df = pd.DataFrame([override_entry])
+        if not os.path.isfile(override_log_file):
+            df.to_csv(override_log_file, index=False)
+        else:
+            df.to_csv(override_log_file, mode='a', header=False, index=False)
+        logger.debug(f"Logged override event: {override_entry}")
+    except Exception as e:
+        logger.error(f"Failed to log override event: {e}")
+
+def set_override(room):
+    """Set an override timer for the specified room."""
+    override_end_time = time.time() + override_duration
+    override_timers[room] = {'end_time': override_end_time}
+    logger.info(f"Override set for room {room} until {datetime.fromtimestamp(override_end_time)}")
+
+def reset_override(room):
+    """Reset the override for the room, if any."""
+    if room in override_timers:
+        override_timers.pop(room, None)
+        logger.info(f"Override for room {room} has been reset.")
+
+def log_sensor_data(device, estimated_room, distances):
+    timestamp = datetime.now().isoformat()
+    data_entry = {"timestamp": timestamp, "device": device, "estimated_room": estimated_room}
+    # Add distances to data_entry
+    for area, distance in distances.items():
+        data_entry[f"distance_to_{area}"] = distance
+    try:
+        df = pd.DataFrame([data_entry])
+        if not os.path.isfile(data_log_file):
+            df.to_csv(data_log_file, index=False)
+        else:
+            df.to_csv(data_log_file, mode='a', header=False, index=False)
+        logger.debug(f"Logged sensor data: {data_entry}")
+    except Exception as e:
+        logger.error(f"Failed to log sensor data: {e}")
+
+def cleanup_old_data(retention_days=30):
+    """
+    Deletes sensor data older than the retention period.
+    """
+    for file in [data_log_file, override_log_file]:
+        if os.path.isfile(file):
+            try:
+                df = pd.read_csv(file, parse_dates=['timestamp'])
+                cutoff_date = datetime.now() - timedelta(days=retention_days)
+                df = df[df['timestamp'] >= cutoff_date]
+                df.to_csv(file, index=False)
+                logger.info(f"Cleaned up data in {file} older than {retention_days} days.")
+            except Exception as e:
+                logger.error(f"Failed to clean up old data in {file}: {e}")
+
+def analyze_data():
+    logger.info("Starting advanced data analysis thread")
+    analysis_output_file = "/app/data/analysis_output.txt"
+    model_file = "/app/data/room_presence_model.pkl"
+    retention_days = 30  # Data retention period in days
+    while True:
+        try:
+            # Clean up old data
+            cleanup_old_data(retention_days=retention_days)
+            if os.path.isfile(data_log_file):
+                df = pd.read_csv(data_log_file, parse_dates=['timestamp'])
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+                df.dropna(inplace=True)
+                df['hour'] = df['timestamp'].dt.hour
+                df['day_of_week'] = df['timestamp'].dt.dayofweek
+
+                # Convert device names to categorical codes
+                df['device_id'] = df['device'].astype('category').cat.codes
+                device_categories = df['device'].astype('category').cat.categories.tolist()
+
+                # Map estimated_room to indices for the target variable
+                df['room_id'] = df['estimated_room'].apply(lambda x: AREAS.index(x) if x in AREAS else -1)
+                room_categories = AREAS
+
+                # Identify distance columns
+                distance_columns = [col for col in df.columns if col.startswith('distance_to_')]
+                distance_columns.sort()  # Ensure consistent order
+
+                # Prepare feature columns
+                X = df[distance_columns + ['hour', 'day_of_week', 'device_id']]
+                y = df['room_id']
+
+                # Remove entries with invalid room_id
+                valid_indices = y != -1
+                X = X[valid_indices]
+                y = y[valid_indices]
+
+                if X.empty:
+                    logger.warning("No valid data available for training after filtering. Skipping model training.")
+                else:
+                    # Save feature names
+                    feature_names = X.columns.tolist()
+
+                    # Split into training and test sets
+                    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+
+                    # Train the model
+                    model = RandomForestClassifier(n_estimators=100, random_state=42)
+                    model.fit(X_train, y_train)
+
+                    # Evaluate the model
+                    y_pred = model.predict(X_test)
+                    report = classification_report(y_test, y_pred, target_names=room_categories)
+
+                    # Save the model and category mappings
+                    model_data = {
+                        'model': model,
+                        'device_categories': device_categories,
+                        'room_categories': room_categories,
+                        'feature_names': feature_names  # Include feature names here
+                    }
+                    joblib.dump(model_data, model_file)
+
+                    # Log the classification report
+                    with open(analysis_output_file, 'w') as f:
+                        f.write("Classification Report:\n")
+                        f.write(report)
+                    logger.info(f"Advanced analysis results written to {analysis_output_file}")
+            else:
+                logger.info("No data available for analysis")
+        except Exception as e:
+            logger.error(f"Error during advanced data analysis: {e}")
+            logger.debug(traceback.format_exc())
+        time.sleep(data_analysis_interval)
+
+async def monitor_overrides():
+    """
+    Monitors for manual overrides by subscribing to state_changed events for lights.
+    """
+    for ws_url in [HOME_ASSISTANT_WS_URL, HOME_ASSISTANT_WSS_URL]:
+        try:
+            logger.info(f"Attempting to connect to {ws_url} for override monitoring")
+            async with websockets.connect(ws_url, timeout=10) as websocket:
+                logger.info(f"Connected to {ws_url} for override monitoring")
+
+                # Wait for 'auth_required' message
+                auth_required_message = await websocket.recv()
+                auth_required = json.loads(auth_required_message)
+                logger.debug(f"Received auth required message: {auth_required}")
+
+                if auth_required.get('type') != 'auth_required':
+                    logger.error(f"Expected 'auth_required' message but received: {auth_required}")
+                    continue  # Try the next URL
+
+                # Send 'auth' message
+                logger.debug("Sending authentication request...")
+                await websocket.send(
+                    json.dumps({"type": "auth", "access_token": LONG_LIVED_ACCESS_TOKEN})
+                )
+
+                # Wait for authentication response
+                auth_response = await websocket.recv()
+                auth_result = json.loads(auth_response)
+                logger.debug(f"Authentication response: {auth_result}")
+
+                if auth_result.get("type") != "auth_ok":
+                    logger.error(f"Authentication failed with {ws_url}: {auth_result.get('message', '')}")
+                    continue  # Try the next URL
+                logger.info(f"Authenticated successfully with Home Assistant using {ws_url}")
+
+                # Subscribe to state_changed events for lights
+                await websocket.send(
+                    json.dumps({"id": 2, "type": "subscribe_events", "event_type": "state_changed"})
+                )
+                logger.debug("Subscribed to state_changed events for override monitoring")
+
+                while True:
+                    message = await websocket.recv()
+                    event = json.loads(message)
+                    # Process only state_changed events
+                    if (
+                        event.get("type") == "event"
+                        and event["event"].get("event_type") == "state_changed"
+                    ):
+                        entity_id = event["event"]["data"]["entity_id"]
+                        new_state = event["event"]["data"]["new_state"]["state"]
+                        old_state = event["event"]["data"]["old_state"]["state"]
+
+                        # Check if the entity is one of our lights
+                        for area in AREAS:
+                            light_entity_id = f"light.{area}_light"
+                            if entity_id == light_entity_id:
+                                # Detect manual override: light was on and now turned off
+                                if old_state == "on" and new_state == "off":
+                                    logger.info(f"Manual override detected for {light_entity_id}")
+                                    # Log the override event
+                                    log_override_event(room=area, light_entity_id=light_entity_id)
+                                    # Set override timer
+                                    set_override(area)
+        except Exception as e:
+            logger.error(f"An error occurred during override monitoring with {ws_url}: {e}")
+            logger.debug(traceback.format_exc())
+            continue  # Try the next URL
+    else:
+        logger.error("All override monitoring connection attempts failed. Retrying in 10 seconds...")
+        await asyncio.sleep(10)  # Wait before retrying
+
+async def monitor_room_location():
+    # Start data analysis in a separate thread
+    analysis_thread = Thread(target=analyze_data)
+    analysis_thread.daemon = True
+    analysis_thread.start()
+
+    # Start override monitoring in a separate task
+    asyncio.create_task(monitor_overrides())
+
+    model_file = "/app/data/room_presence_model.pkl"
+    model, device_category_map, room_categories, feature_names = None, {}, [], []
+    if os.path.isfile(model_file):
+        model_data = joblib.load(model_file)
+        model = model_data['model']
+        device_categories = model_data['device_categories']
+        room_categories = model_data['room_categories']
+        feature_names = model_data['feature_names']  # Load feature names
+        device_category_map = {device: idx for idx, device in enumerate(device_categories)}
+        logger.info("Loaded trained model for real-time predictions.")
+    else:
+        model = None
+        logger.warning("Model file not found. Real-time predictions will not be available.")
+
+    for device in DEVICE_NAMES:
+        current_rooms[device] = None
+        last_action_time[device] = 0
+
+    device_ble_distances = {device: {} for device in DEVICE_NAMES}
+
+    while True:
+        for ws_url in [HOME_ASSISTANT_WS_URL, HOME_ASSISTANT_WSS_URL]:
+            try:
+                logger.info(f"Attempting to connect to {ws_url}")
+                async with websockets.connect(ws_url, timeout=10) as websocket:
+                    logger.info(f"Connected to {ws_url}")
+
+                    # Wait for 'auth_required' message
+                    auth_required_message = await websocket.recv()
+                    auth_required = json.loads(auth_required_message)
+                    logger.debug(f"Received auth required message: {auth_required}")
+
+                    if auth_required.get('type') != 'auth_required':
+                        logger.error(f"Expected 'auth_required' message but received: {auth_required}")
+                        continue  # Try the next URL
+
+                    # Send 'auth' message
+                    logger.debug("Sending authentication request...")
+                    await websocket.send(
+                        json.dumps({"type": "auth", "access_token": LONG_LIVED_ACCESS_TOKEN})
+                    )
+
+                    # Wait for authentication response
+                    auth_response = await websocket.recv()
+                    auth_result = json.loads(auth_response)
+                    logger.debug(f"Authentication response: {auth_result}")
+
+                    if auth_result.get("type") != "auth_ok":
+                        logger.error(f"Authentication failed with {ws_url}: {auth_result.get('message', '')}")
+                        continue  # Try the next URL
+                    logger.info(f"Authenticated successfully with Home Assistant using {ws_url}")
+
+                    # Subscribe to state_changed events
+                    await websocket.send(
+                        json.dumps({"id": 1, "type": "subscribe_events", "event_type": "state_changed"})
+                    )
+                    logger.debug("Subscribed to state_changed events")
+
+                    while True:
+                        message = await websocket.recv()
+                        event = json.loads(message)
+                        # Process only state_changed events
+                        if (
+                            event.get("type") == "event"
+                            and event["event"].get("event_type") == "state_changed"
+                        ):
+                            entity_id = event["event"]["data"]["entity_id"]
+                            new_state = event["event"]["data"]["new_state"]["state"]
+
+                            # Check if the entity is one of our BLE distance sensors
+                            for device in DEVICE_NAMES:
+                                for area in AREAS:
+                                    sensor_id = f"sensor.{device}_ble_distance_to_{area}_ble"
+                                    if entity_id == sensor_id:
+                                        if new_state in ['unknown', 'unavailable', None]:
+                                            logger.warning(f"Distance value for {sensor_id} is '{new_state}'; skipping.")
+                                            continue  # Skip processing this sensor
+                                        try:
+                                            distance = float(new_state)
+                                            device_ble_distances[device][area] = distance
+
+                                            # Proceed if we have enough distance data
+                                            if len(device_ble_distances[device]) >= MIN_REQUIRED_SENSORS:
+                                                # Determine the estimated room
+                                                estimated_room = min(
+                                                    device_ble_distances[device],
+                                                    key=device_ble_distances[device].get
+                                                )
+                                                # Log sensor data
+                                                log_sensor_data(device, estimated_room, device_ble_distances[device])
+
+                                                if model:
+                                                    current_time = datetime.now()
+                                                    device_id = device_category_map.get(device, -1)
+                                                    if device_id == -1:
+                                                        logger.warning(f"Device {device} not recognized by the model.")
+                                                        continue
+
+                                                    # Prepare distances, imputing missing values
+                                                    distances = []
+                                                    for area_name in AREAS:
+                                                        dist = device_ble_distances[device].get(area_name, MAX_DISTANCE)
+                                                        distances.append(dist)
+
+                                                    # Prepare a dictionary with feature names and values
+                                                    data_dict = {f"distance_to_{area}": dist for area, dist in zip(AREAS, distances)}
+                                                    data_dict['hour'] = current_time.hour
+                                                    data_dict['day_of_week'] = current_time.weekday()
+                                                    data_dict['device_id'] = device_id
+
+                                                    # Create a DataFrame with the same feature names as during training
+                                                    feature_vector = pd.DataFrame([data_dict], columns=feature_names)
+
+                                                    # Predict the room
+                                                    predicted_room_id = model.predict(feature_vector)[0]
+                                                    predicted_room = room_categories[predicted_room_id]
+                                                    logger.info(f"Predicted room for {device}: {predicted_room}")
+
+                                                    # Check if the predicted room has changed
+                                                    if current_rooms[device] != predicted_room:
+                                                        if current_rooms[device]:
+                                                            handle_room_change(device, current_rooms[device], "exit")
+                                                        current_rooms[device] = predicted_room
+                                                        handle_room_change(device, predicted_room, "enter")
+                                                else:
+                                                    # Fallback to closest area if model is not available
+                                                    closest_area = estimated_room
+                                                    logger.info(f"{device} is closest to {closest_area}")
+
+                                                    # Check if the closest area has changed
+                                                    if current_rooms[device] != closest_area:
+                                                        if current_rooms[device]:
+                                                            handle_room_change(device, current_rooms[device], "exit")
+                                                        current_rooms[device] = closest_area
+                                                        handle_room_change(device, closest_area, "enter")
+                                        except ValueError:
+                                            logger.error(f"Invalid distance value for {sensor_id}: {new_state}")
+                                            continue  # Handle non-numeric state
+            except websockets.InvalidStatusCode as e:
+                logger.error(f"Connection failed with {ws_url}: {e}")
+                continue  # Try the next URL
+            except Exception as e:
+                logger.error(f"An error occurred with {ws_url}: {e}")
+                logger.debug(traceback.format_exc())
+                continue  # Try the next URL
+        else:
+            logger.error("All connection attempts failed. Retrying in 10 seconds...")
+            await asyncio.sleep(10)  # Wait before retrying
+
+if __name__ == "__main__":
+    try:
+        logger.info("Starting AI agent...")
+        asyncio.run(monitor_room_location())
+    except KeyboardInterrupt:
+        logger.info("AI agent stopped.")
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}")
+        logger.debug(traceback.format_exc())

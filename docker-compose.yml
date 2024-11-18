@@ -1,0 +1,33 @@
+services:
+  ai_agent_container:
+    build: .  # Replace with your Docker image name or use build: . if building locally
+    container_name: ai_agent_container
+    restart: unless-stopped
+    privileged: false
+    security_opt:
+      - no-new-privileges:false
+    environment:
+      - HA_LONG_LIVED_ACCESS_TOKEN=${HA_LONG_LIVED_ACCESS_TOKEN}
+      - HOME_ASSISTANT_WS_URL=ws://192.168.86.91:8123/api/websocket
+      - HOME_ASSISTANT_WSS_URL=wss://b9vctyaqo65gxmkduw29zg4wki6egsxt.ui.nabu.casa/api/websocket
+      - HOME_ASSISTANT_API_URL=http://192.168.86.91:8123/api
+      - HOME_ASSISTANT_CLOUD_API_URL=https://b9vctyaqo65gxmkduw29zg4wki6egsxt.ui.nabu.casa/api
+      - PGID=1000
+      - GUID=1000
+    volumes:
+      - /mnt/nvme/ai_agent_data:/app/data  # Ensure correct permissions for data persistence
+      - ./:/app
+      - ./src/models:/app/src/models
+    networks:
+      - ai_network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]  # Adjust based on your application's health endpoint
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
+    ports:
+      - "8000:8000"
+
+networks:
+  ai_network:
+    driver: bridge
