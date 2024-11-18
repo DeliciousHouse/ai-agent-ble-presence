@@ -25,6 +25,9 @@ def preprocess_data(df):
     """
     Preprocess data to extract feature columns and target variable.
     """
+    # Remove any _ble suffix from area names if present
+    df.columns = [col.replace('_ble', '') for col in df.columns]
+    
     # Ensure timestamp is in datetime format
     df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
     df = df.dropna(subset=['timestamp'])
@@ -33,7 +36,7 @@ def preprocess_data(df):
     df['hour'] = df['timestamp'].dt.hour
     df['day_of_week'] = df['timestamp'].dt.dayofweek
 
-    # List all possible distance columns
+    # List all possible distance columns based on BLE_DEVICES
     distance_columns = [
         'distance_to_balcony', 'distance_to_office', 
         'distance_to_sky_floor', 'distance_to_master_bedroom', 
@@ -41,7 +44,7 @@ def preprocess_data(df):
         'distance_to_lounge', 'distance_to_master_bathroom'
     ]
 
-    # Add missing distance columns and fill with NaN (use 0 if NaN handling is not needed)
+    # Add missing distance columns and fill with NaN
     for col in distance_columns:
         if col not in df.columns:
             df[col] = np.nan  # Use 0 if you prefer non-missing values

@@ -720,7 +720,7 @@ def prepare_features(sensor_data, device, areas):
     # Initialize a dictionary for features
     features = {}
 
-    # Add distance features
+    # Add distance features based on BLE_DEVICES
     for area in areas:
         key = f"distance_to_{area}"
         # Assuming sensor_data contains distance metrics, adjust as needed
