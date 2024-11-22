@@ -1,0 +1,3 @@
+timestamp,entity_id,action
+2024-11-20T18:11:59.148359,light.living_room,turned_on
+2024-11-20T18:12:25.365881,light.lounge_lights,turned_off

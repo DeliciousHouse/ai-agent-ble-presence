@@ -4,20 +4,20 @@ import pandas as pd
 from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
-from src.model_evaluation import evaluate_model
+from model_evaluation import evaluate_model
 
 # Define paths for saving models and encoders
 model_file = "/app/src/models/ble_presence_model.pkl"
 encoder_file = "/app/src/models/label_encoder.pkl"
 
-def train_model(X, y, room_categories):
+def train_model(X, y, area_categories):
     """
     Trains the XGBoost model for BLE-based presence detection and saves the model and LabelEncoder.
 
     Parameters:
         X (pd.DataFrame): Features for training the model.
         y (np.ndarray or pd.Series): Encoded target labels.
-        room_categories (np.ndarray): Array of room names corresponding to label encoding.
+        area_categories (np.ndarray): Array of area names corresponding to label encoding.
     """
     # Debugging checks
     print("Training model with the following features:")
@@ -25,16 +25,16 @@ def train_model(X, y, room_categories):
     print(f"Type of X: {type(X)}")  # Should be <class 'pandas.core.frame.DataFrame'>
     print(f"Type of y: {type(y)}")  # Should be <class 'numpy.ndarray'> or <class 'pandas.core.series.Series'>
 
-    # Define all expected rooms, including new rooms
-    all_rooms = [
+    # Define all expected areas, including new areas
+    all_areas = [
         'lounge', 'master_bedroom', 'kitchen', 'balcony', 'garage', 
         'office', 'front_porch', 'driveway', 'nova_s_room', 'christian_s_room', 
         'sky_floor', 'master_bathroom', 'backyard', 'dining_room', 
         'laundry_room', 'dressing_room',
     ]
-    # Initialize the LabelEncoder with the room categories
+    # Initialize the LabelEncoder with the area categories
     le = LabelEncoder()
-    le.classes_ = np.array(room_categories)
+    le.classes_ = np.array(area_categories)
 
     # Save the encoder for later use during inference
     joblib.dump(le, encoder_file)

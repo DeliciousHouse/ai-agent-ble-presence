@@ -60,20 +60,20 @@ def preprocess_data(df):
     X = df[feature_columns]  # Features
 
     # Encode target variable
-    if 'estimated_room' not in df.columns:
-        raise KeyError("The column 'estimated_room' is missing from the data.")
-    df['estimated_room'] = df['estimated_room'].astype(str)  # Ensure target is string
+    if 'estimated_area' not in df.columns:
+        raise KeyError("The column 'estimated_area' is missing from the data.")
+    df['estimated_area'] = df['estimated_area'].astype(str)  # Ensure target is string
     le = LabelEncoder()
-    y = le.fit_transform(df['estimated_room'])
+    y = le.fit_transform(df['estimated_area'])
 
     # For debugging: Inspect the encoded labels
-    room_mapping = dict(zip(le.classes_, range(len(le.classes_))))
-    print("Room Categories and Encoded Values:", room_mapping)
+    area_mapping = dict(zip(le.classes_, range(len(le.classes_))))
+    print("area Categories and Encoded Values:", area_mapping)
 
-    # Save room categories for later decoding
-    room_categories = le.classes_
+    # Save area categories for later decoding
+    area_categories = le.classes_
 
     # Handle missing values in features
-    X = X.fillna(0)  # Replace with appropriate strategy if needed
+    # X = X.fillna(0)  # Replace with appropriate strategy if needed
 
-    return X, y, room_categories
+    return X, y, area_categories
