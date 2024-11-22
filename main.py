@@ -242,30 +242,50 @@ def get_dynamic_brightness_and_temperature():
 # Function to dynamically generate AREA_ACTIONS based on sensor_data
 def get_area_actions():
     brightness, color_temp = get_dynamic_brightness_and_temperature()
-    area_actions = {
-        area: {
-            "enter": [
-                (
-                    "light",
-                    "turn_on",
-                    {
-                        "entity_id": f"light.{area}_lights",
-                        "brightness": brightness,
-                        "color_temp": color_temp
-                    }
-                )
-            ],
-            "exit": [
-                (
-                    "light",
-                    "turn_off",
-                    {
-                        "entity_id": f"light.{area}_lights"
-                    }
-                )
-            ]
-        } for area in MODEL_AREAS
-    }
+    current_hour = get_local_time().hour
+    is_daytime = 6 <= current_hour < 18  # Define daytime from 6 AM to 6 PM
+
+    area_actions = {}
+    for area in MODEL_AREAS:
+        if is_daytime and area not in ["master_bedroom", "master_bathroom", "office", "sky_floor", "garage"]:
+            # During daytime, turn off lights except specified areas
+            actions = {
+                "enter": [
+                    (
+                        "light",
+                        "turn_off",
+                        {
+                            "entity_id": f"light.{area}_lights"
+                        }
+                    )
+                ],
+                "exit": []  # No action on exit during daytime for these areas
+            }
+        else:
+            # Normal operation
+            actions = {
+                "enter": [
+                    (
+                        "light",
+                        "turn_on",
+                        {
+                            "entity_id": f"light.{area}_lights",
+                            "brightness": brightness,
+                            "color_temp": color_temp
+                        }
+                    )
+                ],
+                "exit": [
+                    (
+                        "light",
+                        "turn_off",
+                        {
+                            "entity_id": f"light.{area}_lights"
+                        }
+                    )
+                ]
+            }
+        area_actions[area] = actions
     return area_actions
 
 # Function to extract device name and area from entity_id
@@ -363,6 +383,7 @@ def is_area_overridden(area):
 # Function to handle area changes
 async def handle_area_change(logger, device, area, action_type, AREA_ACTIONS, user="unknown"):
     current_time = time.time()
+    logger.debug(f"Handling area change for device {device}: {action_type} {area} at {current_time}")
     if last_action_time.get(device, 0) + min_time_between_actions > current_time:
         logger.info(f"Skipping action for {device} {action_type}ing {area} due to debounce.")
         return
@@ -392,6 +413,7 @@ async def handle_area_change(logger, device, area, action_type, AREA_ACTIONS, us
         if service == "turn_on":
             service_data["brightness"] = brightness
             service_data["color_temp"] = color_temp
+        logger.debug(f"Calling service {domain}.{service} with data {service_data}")
         result = await call_service(logger, domain, service, service_data)
         if result:
             logger.info(f"Service call successful for {domain}.{service} in {area}.")
@@ -762,6 +784,7 @@ async def sensor_data_updater(logger):
     """
     while True:
         try:
+            logger.debug("Fetching sensor data from Home Assistant.")
             url = f"{HOME_ASSISTANT_API_URL}/states"
             response = requests.get(url, headers=HEADERS, timeout=10)
             if response.status_code == 200:
@@ -770,7 +793,14 @@ async def sensor_data_updater(logger):
                     for state in states:
                         entity_id = state['entity_id']
                         state_value = state['state']
-                        sensor_data[entity_id] = state_value
+                        # Convert '0' to np.nan
+                        if state_value == "0":
+                            sensor_data[entity_id] = np.nan
+                        else:
+                            try:
+                                sensor_data[entity_id] = float(state_value)
+                            except ValueError:
+                                sensor_data[entity_id] = np.nan
                 logger.debug("Sensor data updated successfully.")
             else:
                 logger.error(f"Failed to fetch sensor states: {response.text}")
@@ -782,7 +812,7 @@ async def sensor_data_updater(logger):
         await asyncio.sleep(10)  # Update every 10 seconds
 
 # Function to handle inference and actions based on predictions
-async def inference_and_handle(logger):
+async def inference_and_handle(logger, model):
     """
     Periodically performs inference for all devices and handles area changes.
     """
@@ -791,10 +821,15 @@ async def inference_and_handle(logger):
             async with sensor_data_lock:
                 devices = DEVICE_NAMES.copy()
             AREA_ACTIONS = get_area_actions()
+            logger.debug(f"Starting inference for devices: {devices}")
             for device in devices:
-                area = await perform_inference(logger, device)
+                logger.debug(f"Performing inference for device: {device}")
+                area = await perform_inference(logger, device, model)
                 if area:
+                    logger.debug(f"Device {device} inferred to be in area {area}")
                     await handle_area_change(logger, device, area, "enter", AREA_ACTIONS, user="inference")
+                else:
+                    logger.debug(f"No confident area prediction for device {device}")
             await asyncio.sleep(60)  # Perform inference every 60 seconds
         except Exception as e:
             logger.error(f"Error in inference_and_handle: {e}")
@@ -802,7 +837,7 @@ async def inference_and_handle(logger):
             await asyncio.sleep(60)
 
 # Function to perform inference using the trained model
-async def perform_inference(logger, device):
+async def perform_inference(logger, device, model):
     """
     Uses the trained model to predict the area of the device based on current sensor data.
     Returns the predicted area if confidence is high enough, else None.
@@ -812,21 +847,25 @@ async def perform_inference(logger, device):
             logger.error(f"Model file {model_file} not found. Inference cannot be performed.")
             return None
         # Load the model
-        model = joblib.load(model_file)
+        logger.debug(f"Loading model from {model_file} for device {device}")
+        # Model is already loaded and passed, no need to load again
         # Access shared sensor_data
         async with sensor_data_lock:
             current_sensor_data = sensor_data.copy()
         # Prepare features
         features = prepare_features(current_sensor_data, device, MODEL_AREAS)
+        logger.debug(f"Prepared features for device {device}: {features}")
         if np.isnan(features).any():
             logger.warning(f"Inference: Missing features for device {device}. Skipping prediction.")
             return None
         # Perform prediction
         prediction = model.predict(features)[0]
+        logger.debug(f"Model prediction for device {device}: {prediction}")
         # Optionally, get prediction probability
         if hasattr(model, "predict_proba"):
             probabilities = model.predict_proba(features)[0]
             confidence = max(probabilities)
+            logger.debug(f"Prediction probabilities for device {device}: {probabilities}")
         else:
             confidence = 1.0  # If model doesn't support predict_proba
         predicted_area = MODEL_AREAS[prediction] if 0 <= prediction < len(MODEL_AREAS) else None
@@ -850,6 +889,7 @@ async def ensure_critical_area_lighting(logger):
             if sun_response.status_code == 200:
                 sun_data = sun_response.json()
                 is_dark = not sun_data.get("state", "above_horizon") == "above_horizon"
+                logger.debug(f"Sun state: {'dark' if is_dark else 'light'}")
             else:
                 logger.warning(f"Failed to fetch sun state: {sun_response.text}")
                 is_dark = False  # Default to not dark if unable to fetch
@@ -867,6 +907,7 @@ async def ensure_critical_area_lighting(logger):
                             "brightness": brightness,
                             "color_temp": color_temp
                         }
+                        logger.debug(f"Ensuring {light_entity} is on due to presence and dark conditions.")
                         result = await call_service(logger, "light", "turn_on", service_data)
                         if result:
                             logger.info(f"Ensured {light_entity} is on due to presence and dark conditions")
@@ -916,6 +957,10 @@ async def main():
 
         # For training, read and preprocess the data in a separate thread
         # This ensures that load_data has already updated sensor_data
+        if not os.path.isfile(sensor_data_log_file):
+            logger.error(f"Sensor data file {sensor_data_log_file} not found after loading data. Exiting.")
+            return
+
         df = pd.read_csv(sensor_data_log_file)
         X, y, area_categories = await asyncio.to_thread(preprocess_data, df)
         if X is None or y is None or area_categories is None:
@@ -935,6 +980,18 @@ async def main():
         logger.debug(traceback.format_exc())
         return
 
+    # Load the trained model once and pass it to inference tasks
+    try:
+        if not os.path.isfile(model_file):
+            logger.error(f"Trained model file {model_file} not found. Exiting.")
+            return
+        logger.debug(f"Loading trained model from {model_file} for inference.")
+        model = joblib.load(model_file)
+    except Exception as e:
+        logger.error(f"Failed to load the trained model: {e}")
+        logger.debug(traceback.format_exc())
+        return
+
     try:
         # Start monitoring tasks
         asyncio.create_task(monitor_overrides(logger))
@@ -942,7 +999,7 @@ async def main():
         asyncio.create_task(monitor_automation_events(logger))
         asyncio.create_task(monitor_light_events(logger))
         asyncio.create_task(sensor_data_updater(logger))  # Ensure sensor_data_updater is running
-        asyncio.create_task(inference_and_handle(logger))  # Start inference loop
+        asyncio.create_task(inference_and_handle(logger, model))  # Start inference loop with the loaded model
         asyncio.create_task(analyze_data(logger))  # Start data analysis loop
 
         logger.info("AI agent is running...")
@@ -992,6 +1049,10 @@ def preprocess_data(df):
     logger = logging.getLogger('ai_agent')
     try:
         # 1. Convert 'timestamp' to datetime if not already
+        if 'timestamp' not in df.columns:
+            logger.error("'timestamp' column missing from sensor data.")
+            return None, None, None
+
         if not np.issubdtype(df['timestamp'].dtype, np.datetime64):
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             logger.debug("Converted 'timestamp' to datetime.")
@@ -1009,6 +1070,10 @@ def preprocess_data(df):
         logger.debug("Extracted 'hour' and 'day_of_week' from 'timestamp'.")
 
         # 4. Encode categorical variables
+        if 'device' not in df.columns or 'estimated_area' not in df.columns:
+            logger.error("'device' or 'estimated_area' columns missing from sensor data.")
+            return None, None, None
+
         df['device'] = df['device'].astype('category')
         df['estimated_area'] = df['estimated_area'].astype('category')
         area_categories = df['estimated_area'].cat.categories.tolist()
@@ -1115,25 +1180,8 @@ def train_model(X, y, area_categories):
         return model
     except Exception as e:
         logger.error(f"Failed to train model: {e}")
+        logger.debug(traceback.format_exc())
         return None
-
-# Function to monitor area location (currently a placeholder)
-async def monitor_area_location(logger, model):
-    while True:
-        try:
-            # Access shared sensor_data
-            async with sensor_data_lock:
-                current_sensor_data = sensor_data.copy()
-            AREA_ACTIONS = get_area_actions()  # Update AREA_ACTIONS with current brightness/color_temp
-
-            # Here, you can implement additional logic if needed, such as periodic predictions
-            # For example, you can trigger predictions at regular intervals instead of on every event
-
-            await asyncio.sleep(1)  # Short delay to prevent tight loop
-        except Exception as e:
-            logger.error(f"Unexpected error in monitor_area_location: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(10)  # Prevent tight loop in case of continuous errors
 
 # Run the main coroutine
 if __name__ == "__main__":

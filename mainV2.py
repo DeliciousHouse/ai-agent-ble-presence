@@ -15,10 +15,10 @@ from sklearn.metrics import classification_report
 from xgboost import XGBClassifier
 import traceback
 import logging
-from aiohttp import web
 import aiofiles
 import random
 from sklearn.impute import SimpleImputer
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -64,7 +64,7 @@ model_file = "/app/src/models/ble_presence_model.pkl"
 
 # Initialize CSV with headers
 def initialize_csv(logger):
-    headers = ["timestamp", "device", "estimated_room"] + [
+    headers = ["timestamp", "device", "estimated_area"] + [
         f"distance_to_{area}" for area in MODEL_AREAS
     ]
     try:
@@ -95,10 +95,10 @@ sensor_data = {}
 sensor_data_lock = asyncio.Lock()
 
 # Additional Shared States
-current_rooms = {}               # Maps device to current room
+current_areas = {}               # Maps device to current area
 last_action_time = {}           # Maps device to last action timestamp
 min_time_between_actions = 5     # Minimum seconds between actions per device
-override_timers = {}            # Maps room to override information
+override_timers = {}            # Maps area to override information
 override_duration = 300         # Duration (in seconds) for which an override is active
 
 # Function to fetch user name based on user_id
@@ -120,19 +120,19 @@ def fetch_user_name(logger, user_id):
         return "unknown"
 
 # Log sensor data to the CSV
-def log_sensor_data(logger, device, estimated_room, distances):
+def log_sensor_data(logger, device, estimated_area, distances):
     current_time = get_local_time()
     timestamp = current_time.isoformat()
-    data_entry = {"timestamp": timestamp, "device": device, "estimated_room": estimated_room}
+    data_entry = {"timestamp": timestamp, "device": device, "estimated_area": estimated_area}
     for area, distance in distances.items():
-        data_entry[f"distance_to_{area}"] = distance
+        data_entry[f"distance_to_{area}"] = distance  # Ensure correct key naming
     try:
         df = pd.DataFrame([data_entry])
         if not os.path.isfile(sensor_data_log_file):
             df.to_csv(sensor_data_log_file, index=False)
         else:
             df.to_csv(sensor_data_log_file, mode='a', header=False, index=False)
-        logger.info(f"Logged sensor data to {sensor_data_log_file}: {data_entry}")
+        logger.debug(f"Logged sensor data to {sensor_data_log_file}: {data_entry}")
     except Exception as e:
         logger.error(f"Failed to log sensor data: {e}")
 
@@ -160,16 +160,12 @@ async def log_automation_action(logger, entity_id, action, brightness=None, user
     current_time = get_local_time()
     timestamp = current_time.isoformat()
     hour = current_time.hour
-    # Access shared sensor_data
-    async with sensor_data_lock:
-        ambient_light = float(sensor_data.get("sensor.curtain_light_level", np.nan))
     log_entry = {
         "timestamp": timestamp,
         "entity_id": entity_id,
         "action": action,
         "brightness": brightness,
         "hour": hour,
-        "ambient_light": ambient_light,
         "user": user
     }
 
@@ -189,16 +185,12 @@ async def log_manual_light_event(logger, entity_id, action, brightness=None, use
     current_time = get_local_time()
     timestamp = current_time.isoformat()
     hour = current_time.hour
-    # Access shared sensor_data
-    async with sensor_data_lock:
-        ambient_light = float(sensor_data.get("sensor.curtain_light_level", np.nan))
     log_entry = {
         "timestamp": timestamp,
         "entity_id": entity_id,
         "action": action,
         "brightness": brightness,
         "hour": hour,
-        "ambient_light": ambient_light,
         "user": user
     }
 
@@ -213,10 +205,10 @@ async def log_manual_light_event(logger, entity_id, action, brightness=None, use
         logger.error(f"Failed to log manual light event: {e}")
 
 # Function to log location
-async def log_location(logger, device, room, action, user="unknown"):
+async def log_location(logger, device, area, action, user="unknown"):
     current_time = get_local_time()
     timestamp = current_time.isoformat()
-    log_entry = {"timestamp": timestamp, "device": device, "room": room, "action": action, "user": user}
+    log_entry = {"timestamp": timestamp, "device": device, "area": area, "action": action, "user": user}
     log_dir = "/app/data"
     os.makedirs(log_dir, exist_ok=True)
     log_file = os.path.join(log_dir, "location_log.json")
@@ -227,69 +219,89 @@ async def log_location(logger, device, room, action, user="unknown"):
     except Exception as e:
         logger.error(f"Failed to write log entry: {e}")
 
-# Function to determine brightness and color temperature based on time and ambient light
-def get_dynamic_brightness_and_temperature(sensor_data):
+# Function to determine brightness and color temperature based on local time
+def get_dynamic_brightness_and_temperature():
     current_hour = get_local_time().hour
-    try:
-        ambient_light = float(sensor_data.get("sensor.curtain_light_level", 0))
-    except (ValueError, TypeError):
-        ambient_light = 0  # Default if sensor data isn't available or invalid
 
-    # Define brightness and temperature based on time and ambient light
+    # Define brightness and temperature based on time
     if 6 <= current_hour < 12:  # Morning
-        brightness = int(max(100, min(255, 255 * (1 - ambient_light / 100))))
+        brightness = 200  # Adjust as needed
         color_temp = 4000  # Cool white for morning
     elif 12 <= current_hour < 18:  # Afternoon
-        brightness = int(max(150, min(255, 255 * (1 - ambient_light / 100))))
+        brightness = 255  # Maximum brightness
         color_temp = 3500  # Natural white for afternoon
     elif 18 <= current_hour < 22:  # Evening
-        brightness = int(max(50, min(180, 180 * (1 - ambient_light / 100))))
+        brightness = 150  # Reduced brightness
         color_temp = 3000  # Warm white for evening
     else:  # Nighttime
-        brightness = int(max(20, min(80, 80 * (1 - ambient_light / 100))))
+        brightness = 50   # Low brightness
         color_temp = 2700  # Very warm white for nighttime
 
     return brightness, color_temp
 
 # Function to dynamically generate AREA_ACTIONS based on sensor_data
-def get_area_actions(sensor_data):
-    brightness, color_temp = get_dynamic_brightness_and_temperature(sensor_data)
-    area_actions = {
-        area: {
-            "enter": [
-                (
-                    "light",
-                    "turn_on",
-                    {
-                        "entity_id": f"light.{area}_lights",
-                        "brightness": brightness,
-                        "color_temp": color_temp
-                    }
-                )
-            ],
-            "exit": [
-                (
-                    "light",
-                    "turn_off",
-                    {
-                        "entity_id": f"light.{area}_lights"
-                    }
-                )
-            ]
-        } for area in MODEL_AREAS
-    }
+def get_area_actions():
+    brightness, color_temp = get_dynamic_brightness_and_temperature()
+    current_hour = get_local_time().hour
+    is_daytime = 6 <= current_hour < 18  # Define daytime from 6 AM to 6 PM
+
+    area_actions = {}
+    for area in MODEL_AREAS:
+        if is_daytime and area not in ["master_bedroom", "master_bathroom", "office", "sky_floor", "garage"]:
+            # During daytime, turn off lights except specified areas
+            actions = {
+                "enter": [
+                    (
+                        "light",
+                        "turn_off",
+                        {
+                            "entity_id": f"light.{area}_lights"
+                        }
+                    )
+                ],
+                "exit": []  # No action on exit during daytime for these areas
+            }
+        else:
+            # Normal operation
+            actions = {
+                "enter": [
+                    (
+                        "light",
+                        "turn_on",
+                        {
+                            "entity_id": f"light.{area}_lights",
+                            "brightness": brightness,
+                            "color_temp": color_temp
+                        }
+                    )
+                ],
+                "exit": [
+                    (
+                        "light",
+                        "turn_off",
+                        {
+                            "entity_id": f"light.{area}_lights"
+                        }
+                    )
+                ]
+            }
+        area_actions[area] = actions
     return area_actions
 
-# Function to extract device name from entity_id
-def extract_device_from_entity_id(entity_id):
+# Function to extract device name and area from entity_id
+def extract_device_and_area_from_entity_id(entity_id):
     """
-    Extracts the device name from the entity_id.
-    Assumes entity_id contains the device name, e.g., 'sensor.bkam_iphone_ble_distance'.
+    Extracts the device name and area from the entity_id.
+    Assumes entity_id follows the pattern: 'sensor.device_name_ble_distance_to_model_area'
+    Returns (device_name, model_area) or (None, None) if pattern doesn't match.
     """
-    for device in DEVICE_NAMES:
-        if device in entity_id:
-            return device
-    return None
+    pattern = r"sensor\.(?P<device_name>.+)_ble_distance_to_(?P<model_area>.+)"
+    match = re.match(pattern, entity_id)
+    if match:
+        device_name = match.group("device_name")
+        model_area = match.group("model_area")
+        return device_name, model_area
+    return None, None
 
 # Function to prepare features for prediction
 def prepare_features(sensor_data, device, areas):
@@ -299,11 +311,25 @@ def prepare_features(sensor_data, device, areas):
     # Add distance features based on MODEL_AREAS
     for area in areas:
         key = f"distance_to_{area}"
-        # Assuming sensor_data contains distance metrics, adjust as needed
-        try:
-            features[key] = float(sensor_data.get(f"sensor.{area}_distance", 0))
-        except ValueError:
-            features[key] = 0  # Default if conversion fails
+        # Extract all relevant sensors for this area based on naming pattern
+        relevant_sensors = [
+            sensor_id for sensor_id in sensor_data.keys()
+            if sensor_id.startswith(f"sensor.{device}_ble_distance_to_{area}")
+        ]
+        distances = []
+        for sensor in relevant_sensors:
+            distance_value = sensor_data.get(sensor, np.nan)
+            try:
+                distance = float(distance_value) if not pd.isna(distance_value) else np.nan
+                distances.append(distance)
+            except (ValueError, TypeError):
+                continue  # Skip invalid entries
+        if distances:
+            # For presence detection, using the minimum distance makes sense
+            aggregated_distance = min(distances)
+        else:
+            aggregated_distance = np.nan
+        features[key] = aggregated_distance
 
     # Add time-based features
     current_time = get_local_time()
@@ -317,11 +343,14 @@ def prepare_features(sensor_data, device, areas):
     device_idx = device_category_map.get(device_id, -1)
     features['device_id'] = device_idx
 
-    # Ensure all feature_names are present
-    # Assuming feature order: ['hour', 'day_of_week'] + ['distance_to_<area>'] + ['device_id']
-    feature_values = [features.get(name, 0) for name in ['hour', 'day_of_week'] + [f"distance_to_{area}" for area in areas] + ['device_id']]
+    # Convert features to a DataFrame
+    feature_df = pd.DataFrame([features])
 
-    return np.array(feature_values).reshape(1, -1)  # Reshape for prediction
+    # Handle missing values (NaN) by imputing with median (consistent with training)
+    imputer = SimpleImputer(strategy='median')
+    feature_df_imputed = imputer.fit_transform(feature_df)
+
+    return feature_df_imputed  # Returns a numpy array suitable for prediction
 
 # Define floor and section BLE data
 FLOOR_MAP = {
@@ -337,45 +366,46 @@ FLOOR_MAP = {
     }
 }
 
-def determine_floor_and_section(room):
+def determine_floor_and_section(area):
     for floor, sections in FLOOR_MAP.items():
-        for section, rooms in sections.items():
-            if room in rooms:
+        for section, areas_in_section in sections.items():
+            if area in areas_in_section:
                 return floor, section
     return None, None
 
-# Function to check if a room is currently overridden
-def is_room_overridden(room):
+# Function to check if an area is currently overridden
+def is_area_overridden(area):
     # Check override_timers dictionary
     current_time = time.time()
-    override_info = override_timers.get(room)
+    override_info = override_timers.get(area)
     return override_info is not None and override_info['end_time'] > current_time
 
-# Function to handle room changes
-async def handle_room_change(logger, device, room, action_type, AREA_ACTIONS, user="unknown"):
+# Function to handle area changes
+async def handle_area_change(logger, device, area, action_type, AREA_ACTIONS, user="unknown"):
     current_time = time.time()
+    logger.debug(f"Handling area change for device {device}: {action_type} {area} at {current_time}")
     if last_action_time.get(device, 0) + min_time_between_actions > current_time:
-        logger.info(f"Skipping action for {device} {action_type}ing {room} due to debounce.")
+        logger.info(f"Skipping action for {device} {action_type}ing {area} due to debounce.")
         return
     # Access shared sensor_data
     async with sensor_data_lock:
         current_sensor_data = sensor_data.copy()
-    brightness, color_temp = get_dynamic_brightness_and_temperature(current_sensor_data)
+    brightness, color_temp = get_dynamic_brightness_and_temperature()
 
-    logger.info(f"{device} {action_type}ing room: {room}")
-    actions = AREA_ACTIONS.get(room, {}).get(action_type, [])
-    current_floor, current_section = determine_floor_and_section(room)
-    prev_room = current_rooms.get(device)
-    if prev_room:
-        prev_floor, prev_section = determine_floor_and_section(prev_room)
+    logger.info(f"{device} {action_type}ing area: {area}")
+    actions = AREA_ACTIONS.get(area, {}).get(action_type, [])
+    current_floor, current_section = determine_floor_and_section(area)
+    prev_area = current_areas.get(device)
+    if prev_area:
+        prev_floor, prev_section = determine_floor_and_section(prev_area)
         if current_floor != prev_floor:
-            logger.warning(f"Invalid transition detected: {prev_room} (floor {prev_floor}) to {room} (floor {current_floor}). Skipping.")
+            logger.warning(f"Invalid transition detected: {prev_area} (floor {prev_floor}) to {area} (floor {current_floor}). Skipping.")
             return 
         elif current_section != prev_section:
-            logger.info(f"Transition within the same floor: {prev_room} to {room}. Proceeding.") 
+            logger.info(f"Transition within the same floor: {prev_area} to {area}. Proceeding.") 
 
-    if is_room_overridden(room):
-        logger.info(f"Room {room} is currently overridden. Skipping {action_type} actions.")
+    if is_area_overridden(area):
+        logger.info(f"Area {area} is currently overridden. Skipping {action_type} actions.")
         return
 
     for domain, service, service_data in actions:
@@ -383,25 +413,26 @@ async def handle_room_change(logger, device, room, action_type, AREA_ACTIONS, us
         if service == "turn_on":
             service_data["brightness"] = brightness
             service_data["color_temp"] = color_temp
+        logger.debug(f"Calling service {domain}.{service} with data {service_data}")
         result = await call_service(logger, domain, service, service_data)
         if result:
-            logger.info(f"Service call successful for {domain}.{service} in {room}.")
+            logger.info(f"Service call successful for {domain}.{service} in {area}.")
         else:
-            logger.warning(f"Service call failed for {domain}.{service} in {room}. Implementing fallback...")
+            logger.warning(f"Service call failed for {domain}.{service} in {area}. Implementing fallback...")
 
-    await log_location(logger, device, room, action_type, user=user)
+    await log_location(logger, device, area, action_type, user)
     last_action_time[device] = current_time
-    current_rooms[device] = room
+    current_areas[device] = area
 
 # Function to log override events
-async def log_override_event(logger, room, light_entity_id, user="unknown"):
+async def log_override_event(logger, area, light_entity_id, user="unknown"):
     current_time = get_local_time()
     timestamp = current_time.isoformat()
     hour = current_time.hour
     day_of_week = current_time.weekday()
     override_entry = {
         "timestamp": timestamp,
-        "room": room,
+        "area": area,
         "light_entity_id": light_entity_id,
         "user": user,
         "hour": hour,
@@ -418,18 +449,18 @@ async def log_override_event(logger, room, light_entity_id, user="unknown"):
         logger.error(f"Failed to log override event: {e}")
 
 # Function to set override
-def set_override(room, logger):
+def set_override(area, logger):
     override_end_time = time.time() + override_duration
-    override_timers[room] = {'end_time': override_end_time}
+    override_timers[area] = {'end_time': override_end_time}
     # Schedule the reset_override coroutine
     loop = asyncio.get_event_loop()
-    loop.create_task(reset_override(logger, room))
+    loop.create_task(reset_override(logger, area))
 
 # Function to reset override
-async def reset_override(logger, room):
+async def reset_override(logger, area):
     await asyncio.sleep(override_duration)
-    override_timers.pop(room, None)
-    logger.info(f"Override for room {room} has been reset.")
+    override_timers.pop(area, None)
+    logger.info(f"Override for area {area} has been reset.")
 
 # Function to cleanup old data
 async def cleanup_old_data(logger, retention_days=30):
@@ -456,37 +487,41 @@ async def analyze_data(logger):
                 try:
                     # Read CSV with error handling for bad lines
                     df = pd.read_csv(sensor_data_log_file, parse_dates=['timestamp'], on_bad_lines='skip')
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+
                     # Proceed with data analysis...
                     df.dropna(inplace=True)
                     df['hour'] = df['timestamp'].dt.hour
                     df['day_of_week'] = df['timestamp'].dt.dayofweek
-    
+
                     # Encode categorical variables
                     df['device_id'] = df['device'].astype('category').cat.codes
                     device_categories = df['device'].astype('category').cat.categories.tolist()
-    
-                    # Encode rooms
-                    df['room_id'] = df['estimated_room'].apply(lambda x: MODEL_AREAS.index(x) if x in MODEL_AREAS else -1)
-                    room_categories_list = MODEL_AREAS  # Avoid overwriting the global room_categories
-    
+
+                    # Encode areas
+                    df['area_id'] = df['estimated_area'].apply(lambda x: MODEL_AREAS.index(x) if x in MODEL_AREAS else -1)
+                    area_categories_list = MODEL_AREAS  # Avoid overwriting the global area_categories
+
                     # Feature columns
                     distance_columns = [f"distance_to_{area}" for area in MODEL_AREAS]
                     distance_columns.sort()
-    
+
                     X = df[distance_columns + ['hour', 'day_of_week', 'device_id']]
-                    y = df['room_id']
-    
+                    y = df['area_id']
+
                     valid_indices = y != -1
                     X = X[valid_indices]
                     y = y[valid_indices]
-    
+
                     if X.empty:
                         logger.warning("No valid data available for training after filtering. Skipping model training.")
                     else:
                         feature_names = X.columns.tolist()
-    
+
+                        # Handle missing values with imputation
+                        imputer = SimpleImputer(strategy='median')
+                        X_imputed = imputer.fit_transform(X)
+
                         # Train the model
                         model = XGBClassifier(
                             n_estimators=100,
@@ -498,14 +533,14 @@ async def analyze_data(logger):
                             use_label_encoder=False,
                             eval_metric='mlogloss'
                         )
-                        model.fit(X, y)
-    
-                        y_pred = model.predict(X)
-                        report = classification_report(y, y_pred, target_names=room_categories_list)
-    
+                        model.fit(X_imputed, y)
+
+                        y_pred = model.predict(X_imputed)
+                        report = classification_report(y, y_pred, target_names=area_categories_list)
+
                         # Save the model
                         joblib.dump(model, model_file)
-    
+
                         # Write analysis report
                         async with aiofiles.open(analysis_output_file, 'w') as f:
                             await f.write("Classification Report:\n")
@@ -563,16 +598,18 @@ async def monitor_overrides(logger):
                                 if user_id != "unknown":
                                     user_name = fetch_user_name(logger, user_id)
 
-                                for area in MODEL_AREAS:
+                                # Extract device and area from entity_id
+                                device_name, area = extract_device_and_area_from_entity_id(entity_id)
+                                if device_name and area in MODEL_AREAS:
                                     light_entity_id = f"light.{area}_lights"
                                     if entity_id == light_entity_id:
                                         if old_state == "on" and new_state == "off":
                                             logger.info(f"Manual override detected for {light_entity_id}")
-                                            await log_override_event(logger, room=area, light_entity_id=light_entity_id, user=user_name)
+                                            await log_override_event(logger, area=area, light_entity_id=light_entity_id, user=user_name)
                                             set_override(area, logger)
                                         elif old_state == "off" and new_state == "on":
                                             logger.info(f"Manual override turned on for {light_entity_id}")
-                                            await log_override_event(logger, room=area, light_entity_id=light_entity_id, user=user_name)
+                                            await log_override_event(logger, area=area, light_entity_id=light_entity_id, user=user_name)
                                             set_override(area, logger)
                         except json.JSONDecodeError as e:
                             logger.error(f"JSON decode error in monitor_overrides: {e}")
@@ -646,8 +683,8 @@ async def monitor_light_events(logger):
                                         # Check for brightness change
                                         if "attributes" in new_state and "brightness" in new_state["attributes"]:
                                             new_brightness = new_state["attributes"]["brightness"]
-                                            old_brightness = old_state["attributes"].get("brightness", 0)
-                                            if new_brightness != old_brightness:
+                                            old_brightness = old_state["attributes"].get("brightness", np.nan)
+                                            if not pd.isna(new_brightness) and not pd.isna(old_brightness) and new_brightness != old_brightness:
                                                 action = "brightness_changed"
                                                 brightness = new_brightness
                                                 logger.info(f"Manual light event: {entity_id} brightness changed to {brightness} by {user_name}")
@@ -715,8 +752,9 @@ async def monitor_automation_events(logger):
                                     user_name = fetch_user_name(logger, user_id)
 
                                 if entity_id.startswith("automation.") and automation_state == "on":
+                                    # Derive affected light entity
                                     affected_light = entity_id.replace("automation.", "light.")
-                                    brightness, color_temp = get_dynamic_brightness_and_temperature({})
+                                    brightness, color_temp = get_dynamic_brightness_and_temperature()
                                     logger.info(f"Automation triggered: {automation_state} for {affected_light}")
                                     await log_automation_action(logger, affected_light, "triggered", brightness=brightness, user=user_name)
                         except json.JSONDecodeError as e:
@@ -739,235 +777,282 @@ async def monitor_automation_events(logger):
                 backoff_base = sleep_time  # Increase backoff
         await asyncio.sleep(5)  # Short delay before next connection attempt
 
-# Dedicated sensor data updater
+# Function to update sensor data periodically
 async def sensor_data_updater(logger):
     """
-    Maintains a WebSocket connection to Home Assistant to continuously listen for sensor updates.
-    Updates the shared sensor_data dictionary accordingly and triggers inference as needed.
+    Periodically fetches sensor data from Home Assistant and updates the shared sensor_data dictionary.
     """
-    ws_urls = [HOME_ASSISTANT_WS_URL, HOME_ASSISTANT_WSS_URL]
-    backoff_base = 1  # Start with 1 second
-    backoff_max = 60  # Maximum backoff time
-    while True:
-        for ws_url in ws_urls:
-            if not ws_url:
-                continue
-            try:
-                async with websockets.connect(ws_url, timeout=10) as websocket:
-                    logger.info(f"Connected to Home Assistant WebSocket for sensor data: {ws_url}")
-
-                    # Authenticate with Home Assistant
-                    await websocket.send(json.dumps({"type": "auth", "access_token": LONG_LIVED_ACCESS_TOKEN}))
-                    auth_response = await websocket.recv()
-                    auth_result = json.loads(auth_response)
-                    if auth_result.get("type") != "auth_ok":
-                        logger.error(f"Authentication failed with {ws_url}: {auth_result.get('message', '')}")
-                        continue
-                    logger.info(f"Authenticated successfully with {ws_url} for sensor data")
-
-                    # Subscribe to state_changed events
-                    await websocket.send(json.dumps({"id": 1, "type": "subscribe_events", "event_type": "state_changed"}))
-                    logger.debug("Subscribed to state_changed events for sensor data")
-
-                    backoff = backoff_base  # Reset backoff after successful connection
-
-                    while True:
-                        try:
-                            message = await websocket.recv()
-                            event = json.loads(message)
-                            if event.get("type") == "event" and event["event"].get("event_type") == "state_changed":
-                                entity_id = event["event"]["data"]["entity_id"]
-                                new_state = event["event"]["data"]["new_state"]
-                                if new_state:
-                                    # Update sensor_data for relevant sensors
-                                    if entity_id.startswith("sensor."):
-                                        async with sensor_data_lock:
-                                            sensor_data[entity_id] = new_state["state"]
-                                        logger.debug(f"Updated sensor_data: {entity_id} = {new_state['state']}")
-                                        # Trigger inference after sensor data update
-                                        device = extract_device_from_entity_id(entity_id)
-                                        if device:
-                                            room = await perform_inference(logger, device)
-                                            if room:
-                                                AREA_ACTIONS = get_area_actions(sensor_data.copy())
-                                                await handle_room_change(logger, device, room, "enter", AREA_ACTIONS, user="inference")
-                        except json.JSONDecodeError as e:
-                            logger.error(f"JSON decode error in sensor_data_updater: {e}")
-                            continue
-                        except websockets.exceptions.ConnectionClosedError as e:
-                            logger.error(f"WebSocket connection closed in sensor_data_updater: {e}")
-                            break  # Break inner loop to attempt reconnection
-                        except Exception as e:
-                            logger.error(f"Unexpected error in sensor_data_updater: {e}")
-                            logger.debug(traceback.format_exc())
-                            break  # Break inner loop to attempt reconnection
-            except Exception as e:
-                logger.error(f"Error connecting to {ws_url} for sensor data: {e}")
-                logger.debug(traceback.format_exc())
-                # Implement exponential backoff with jitter
-                sleep_time = min(backoff_max, backoff_base * 2)
-                jitter = random.uniform(0, 1)
-                await asyncio.sleep(sleep_time + jitter)
-                backoff_base = sleep_time  # Increase backoff
-        await asyncio.sleep(5)  # Short delay before next connection attempt
-
-# Function to perform inference using the trained model
-async def perform_inference(logger, device):
-    """
-    Uses the trained model to predict the room of the device based on current sensor data.
-    Returns the predicted room if confidence is high enough, else None.
-    """
-    try:
-        if not os.path.isfile(model_file):
-            logger.error(f"Model file {model_file} not found. Inference cannot be performed.")
-            return None
-        # Load the model
-        model = joblib.load(model_file)
-        # Access shared sensor_data
-        async with sensor_data_lock:
-            current_sensor_data = sensor_data.copy()
-        # Prepare features
-        features = prepare_features(current_sensor_data, device, MODEL_AREAS)
-        # Perform prediction
-        prediction = model.predict(features)[0]
-        # Optionally, get prediction probability
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)[0]
-            confidence = max(probabilities)
-        else:
-            confidence = 1.0  # If model doesn't support predict_proba
-        predicted_room = MODEL_AREAS[prediction] if 0 <= prediction < len(MODEL_AREAS) else None
-        if predicted_room and confidence > 0.6:  # Threshold can be adjusted
-            logger.info(f"Inference: Device {device} is in room {predicted_room} with confidence {confidence:.2f}")
-            return predicted_room
-        else:
-            logger.warning(f"Inference: Low confidence ({confidence:.2f}) for device {device}. Predicted room: {predicted_room}")
-            return None
-    except Exception as e:
-        logger.error(f"Error during inference for device {device}: {e}")
-        logger.debug(traceback.format_exc())
-        return None
-
-# Function to ensure critical area lighting based on presence and ambient light
-async def ensure_critical_area_lighting(logger):
-    while True:
-        current_hour = get_local_time().hour
-        is_dark = 18 <= current_hour or current_hour < 6  # Example darkness condition
-        # Access shared sensor_data
-        async with sensor_data_lock:
-            current_sensor_data = sensor_data.copy()
-        try:
-            ambient_light = float(current_sensor_data.get("sensor.curtain_light_level", 0))
-        except (ValueError, TypeError):
-            ambient_light = 0  # Default if sensor data isn't available or invalid
-
-        for area, presence_sensor in [("balcony", "sensor.balcony_presence"), ("backyard", "sensor.backyard_presence")]:
-            presence_state = current_sensor_data.get(presence_sensor, "off")
-            light_entity = f"light.{area}_lights"
-
-            if is_dark and presence_state == "on" and ambient_light < 30:  # Adjust ambient threshold as needed
-                # Fetch latest brightness and color_temp
-                brightness, color_temp = get_dynamic_brightness_and_temperature(current_sensor_data)
-                service_data = {
-                    "entity_id": light_entity,
-                    "brightness": brightness,
-                    "color_temp": color_temp
-                }
-                result = await call_service(logger, "light", "turn_on", service_data)
-                if result:
-                    logger.info(f"Ensured {light_entity} is on due to presence and low light")
-                else:
-                    logger.warning(f"Failed to ensure {light_entity} is on. Retrying or implementing fallback...")
-
-        await asyncio.sleep(60)  # Check every 60 seconds
-
-# Function to monitor room location (placeholder for actual implementation)
-async def monitor_room_location(logger, model):
-    # Schedule analyze_data as a background task
-    asyncio.create_task(analyze_data(logger))
-
-    # Start asynchronous tasks concurrently
-    asyncio.create_task(monitor_overrides(logger))
-    asyncio.create_task(ensure_critical_area_lighting(logger))
-    asyncio.create_task(monitor_automation_events(logger))
-    asyncio.create_task(monitor_light_events(logger))
-    asyncio.create_task(sensor_data_updater(logger))  # Ensure sensor_data_updater is running
-    asyncio.create_task(inference_and_handle(logger))  # Start inference loop
-
     while True:
         try:
-            # Access shared sensor_data
-            async with sensor_data_lock:
-                current_sensor_data = sensor_data.copy()
-            AREA_ACTIONS = get_area_actions(current_sensor_data)  # Update AREA_ACTIONS with current brightness/color_temp
-
-            # Here, you can implement additional logic if needed, such as periodic predictions
-            # For example, you can trigger predictions at regular intervals instead of on every event
-
-            await asyncio.sleep(1)  # Short delay to prevent tight loop
+            logger.debug("Fetching sensor data from Home Assistant.")
+            url = f"{HOME_ASSISTANT_API_URL}/states"
+            response = requests.get(url, headers=HEADERS, timeout=10)
+            if response.status_code == 200:
+                states = response.json()
+                async with sensor_data_lock:
+                    for state in states:
+                        entity_id = state['entity_id']
+                        state_value = state['state']
+                        # Convert '0' to np.nan
+                        if state_value == "0":
+                            sensor_data[entity_id] = np.nan
+                        else:
+                            try:
+                                sensor_data[entity_id] = float(state_value)
+                            except ValueError:
+                                sensor_data[entity_id] = np.nan
+                logger.debug("Sensor data updated successfully.")
+            else:
+                logger.error(f"Failed to fetch sensor states: {response.text}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching sensor states: {e}")
         except Exception as e:
-            logger.error(f"Unexpected error in monitor_room_location: {e}")
+            logger.error(f"Unexpected error in sensor_data_updater: {e}")
             logger.debug(traceback.format_exc())
-            await asyncio.sleep(10)  # Prevent tight loop in case of continuous errors
+        await asyncio.sleep(10)  # Update every 10 seconds
 
-# Function to perform inference and handle room changes
-async def inference_and_handle(logger):
+# Function to handle inference and actions based on predictions
+async def inference_and_handle(logger, model):
     """
-    Periodically performs inference for all devices and handles room changes.
+    Periodically performs inference for all devices and handles area changes.
     """
     while True:
         try:
             async with sensor_data_lock:
-                devices = [device for device in DEVICE_NAMES]
-            AREA_ACTIONS = get_area_actions(sensor_data.copy())
+                devices = DEVICE_NAMES.copy()
+            AREA_ACTIONS = get_area_actions()
+            logger.debug(f"Starting inference for devices: {devices}")
             for device in devices:
-                room = await perform_inference(logger, device)
-                if room:
-                    await handle_room_change(logger, device, room, "enter", AREA_ACTIONS, user="inference")
+                logger.debug(f"Performing inference for device: {device}")
+                area = await perform_inference(logger, device, model)
+                if area:
+                    logger.debug(f"Device {device} inferred to be in area {area}")
+                    await handle_area_change(logger, device, area, "enter", AREA_ACTIONS, user="inference")
+                else:
+                    logger.debug(f"No confident area prediction for device {device}")
             await asyncio.sleep(60)  # Perform inference every 60 seconds
         except Exception as e:
             logger.error(f"Error in inference_and_handle: {e}")
             logger.debug(traceback.format_exc())
             await asyncio.sleep(60)
 
-# Health server implementation using aiohttp
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_health_server(logger):
-    app = web.Application()
-    app.router.add_get('/health', health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8000)
-    await site.start()
-    logger.info("Health server started on port 8000")
-
-# Function to load data
-def load_data():
+# Function to perform inference using the trained model
+async def perform_inference(logger, device, model):
     """
-    Loads raw sensor data from CSV files.
-    Returns a pandas DataFrame.
+    Uses the trained model to predict the area of the device based on current sensor data.
+    Returns the predicted area if confidence is high enough, else None.
     """
-    logger = logging.getLogger('ai_agent')
     try:
-        # Example: Load sensor data from a CSV file
-        sensor_data_path = sensor_data_log_file
-        df = pd.read_csv(sensor_data_path)
-        logger.info(f"Loaded sensor data from {sensor_data_path}")
-        return df
+        if not os.path.isfile(model_file):
+            logger.error(f"Model file {model_file} not found. Inference cannot be performed.")
+            return None
+        # Load the model
+        logger.debug(f"Loading model from {model_file} for device {device}")
+        # Model is already loaded and passed, no need to load again
+        # Access shared sensor_data
+        async with sensor_data_lock:
+            current_sensor_data = sensor_data.copy()
+        # Prepare features
+        features = prepare_features(current_sensor_data, device, MODEL_AREAS)
+        logger.debug(f"Prepared features for device {device}: {features}")
+        if np.isnan(features).any():
+            logger.warning(f"Inference: Missing features for device {device}. Skipping prediction.")
+            return None
+        # Perform prediction
+        prediction = model.predict(features)[0]
+        logger.debug(f"Model prediction for device {device}: {prediction}")
+        # Optionally, get prediction probability
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(features)[0]
+            confidence = max(probabilities)
+            logger.debug(f"Prediction probabilities for device {device}: {probabilities}")
+        else:
+            confidence = 1.0  # If model doesn't support predict_proba
+        predicted_area = MODEL_AREAS[prediction] if 0 <= prediction < len(MODEL_AREAS) else None
+        if predicted_area and confidence > 0.6:  # Threshold can be adjusted
+            logger.info(f"Inference: Device {device} is in area {predicted_area} with confidence {confidence:.2f}")
+            return predicted_area
+        else:
+            logger.warning(f"Inference: Low confidence ({confidence:.2f}) for device {device}. Predicted area: {predicted_area}")
+            return None
     except Exception as e:
-        logger.error(f"Failed to load data: {e}")
+        logger.error(f"Error during inference for device {device}: {e}")
+        logger.debug(traceback.format_exc())
         return None
 
+# Function to ensure critical area lighting based on presence
+async def ensure_critical_area_lighting(logger):
+    while True:
+        try:
+            # Determine if it's dark based on sun state
+            sun_response = requests.get(f"{HOME_ASSISTANT_API_URL}/sun/state", headers=HEADERS, timeout=10)
+            if sun_response.status_code == 200:
+                sun_data = sun_response.json()
+                is_dark = not sun_data.get("state", "above_horizon") == "above_horizon"
+                logger.debug(f"Sun state: {'dark' if is_dark else 'light'}")
+            else:
+                logger.warning(f"Failed to fetch sun state: {sun_response.text}")
+                is_dark = False  # Default to not dark if unable to fetch
+
+            try:
+                for area, presence_sensor in [("balcony", "sensor.balcony_presence"), ("backyard", "sensor.backyard_presence")]:
+                    presence_state = sensor_data.get(presence_sensor, "off")
+                    light_entity = f"light.{area}_lights"
+
+                    if is_dark and presence_state == "on":
+                        # Fetch latest brightness and color_temp based on local time
+                        brightness, color_temp = get_dynamic_brightness_and_temperature()
+                        service_data = {
+                            "entity_id": light_entity,
+                            "brightness": brightness,
+                            "color_temp": color_temp
+                        }
+                        logger.debug(f"Ensuring {light_entity} is on due to presence and dark conditions.")
+                        result = await call_service(logger, "light", "turn_on", service_data)
+                        if result:
+                            logger.info(f"Ensured {light_entity} is on due to presence and dark conditions")
+                        else:
+                            logger.warning(f"Failed to ensure {light_entity} is on. Retrying or implementing fallback...")
+            except Exception as e:
+                logger.error(f"Error in ensure_critical_area_lighting: {e}")
+                logger.debug(traceback.format_exc())
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error fetching sun state: {e}")
+            is_dark = False  # Default to not dark if unable to fetch
+        except Exception as e:
+            logger.error(f"Unexpected error in ensure_critical_area_lighting: {e}")
+            logger.debug(traceback.format_exc())
+
+        await asyncio.sleep(60)  # Check every 60 seconds
+
+# Main application logic
+async def main():
+    # Initialize asynchronous logger
+    logger = logging.getLogger('ai_agent')
+    logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs during testing
+
+    # Create and add file handler
+    file_handler = logging.FileHandler(ai_agent_log_file)
+    file_handler.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    # Create and add stream handler (logs to STDOUT)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
+    stream_formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
+    stream_handler.setFormatter(stream_formatter)
+    logger.addHandler(stream_handler)
+
+    # Initialize CSV file
+    initialize_csv(logger)
+
+    # Load and preprocess data
+    try:
+        logger.info("Loading and preprocessing data...")
+        # Load data without returning a DataFrame
+        await asyncio.to_thread(load_data, logger)
+
+        # For training, read and preprocess the data in a separate thread
+        # This ensures that load_data has already updated sensor_data
+        if not os.path.isfile(sensor_data_log_file):
+            logger.error(f"Sensor data file {sensor_data_log_file} not found after loading data. Exiting.")
+            return
+
+        df = pd.read_csv(sensor_data_log_file)
+        X, y, area_categories = await asyncio.to_thread(preprocess_data, df)
+        if X is None or y is None or area_categories is None:
+            logger.error("Preprocessing failed. Exiting.")
+            return
+
+        # Train the model
+        logger.info("Training the model...")
+        model = await asyncio.to_thread(train_model, X, y, area_categories)
+        if model is None:
+            logger.error("Model training failed. Exiting.")
+            return
+
+        logger.info("Model training completed.")
+    except Exception as e:
+        logger.error(f"Error during data loading and model training: {e}")
+        logger.debug(traceback.format_exc())
+        return
+
+    # Load the trained model once and pass it to inference tasks
+    try:
+        if not os.path.isfile(model_file):
+            logger.error(f"Trained model file {model_file} not found. Exiting.")
+            return
+        logger.debug(f"Loading trained model from {model_file} for inference.")
+        model = joblib.load(model_file)
+    except Exception as e:
+        logger.error(f"Failed to load the trained model: {e}")
+        logger.debug(traceback.format_exc())
+        return
+
+    try:
+        # Start monitoring tasks
+        asyncio.create_task(monitor_overrides(logger))
+        asyncio.create_task(ensure_critical_area_lighting(logger))
+        asyncio.create_task(monitor_automation_events(logger))
+        asyncio.create_task(monitor_light_events(logger))
+        asyncio.create_task(sensor_data_updater(logger))  # Ensure sensor_data_updater is running
+        asyncio.create_task(inference_and_handle(logger, model))  # Start inference loop with the loaded model
+        asyncio.create_task(analyze_data(logger))  # Start data analysis loop
+
+        logger.info("AI agent is running...")
+    except Exception as e:
+        logger.error(f"Error starting AI agent tasks: {e}")
+        logger.debug(traceback.format_exc())
+        return
+
+    # Keep the main coroutine running
+    while True:
+        await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
+
+# Function to load data (Modified to not return a pandas DataFrame)
+def load_data(logger):
+    """
+    Loads raw sensor data from CSV files and updates the shared sensor_data dictionary.
+    Does not return a pandas DataFrame.
+    """
+    try:
+        # Check if the sensor data CSV exists
+        if not os.path.isfile(sensor_data_log_file):
+            logger.warning(f"Sensor data file {sensor_data_log_file} does not exist. Skipping data load.")
+            return
+
+        # Read the sensor data CSV
+        df = pd.read_csv(sensor_data_log_file)
+
+        # Iterate over each row and update sensor_data
+        for index, row in df.iterrows():
+            device = row['device']
+            estimated_area = row['estimated_area']
+            distances = {f"distance_to_{area}": row.get(f"distance_to_{area}", np.nan) for area in MODEL_AREAS}
+
+            # Log sensor data
+            log_sensor_data(logger, device, estimated_area, distances)
+
+        logger.info("Sensor data loaded and shared data updated.")
+    except Exception as e:
+        logger.error(f"Failed to load and process data: {e}")
+
+# Function to preprocess data (Completed try-except)
 def preprocess_data(df):
     """
     Preprocesses the raw sensor data.
-    Returns feature matrix X, target vector y, and list of room categories.
+    Returns feature matrix X, target vector y, and list of area categories.
     """
     logger = logging.getLogger('ai_agent')
     try:
         # 1. Convert 'timestamp' to datetime if not already
+        if 'timestamp' not in df.columns:
+            logger.error("'timestamp' column missing from sensor data.")
+            return None, None, None
+
         if not np.issubdtype(df['timestamp'].dtype, np.datetime64):
             df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
             logger.debug("Converted 'timestamp' to datetime.")
@@ -985,14 +1070,18 @@ def preprocess_data(df):
         logger.debug("Extracted 'hour' and 'day_of_week' from 'timestamp'.")
 
         # 4. Encode categorical variables
-        df['device'] = df['device'].astype('category')
-        df['estimated_room'] = df['estimated_room'].astype('category')
-        room_categories = df['estimated_room'].cat.categories.tolist()
-        logger.debug("Encoded 'device' and 'estimated_room' as categorical.")
+        if 'device' not in df.columns or 'estimated_area' not in df.columns:
+            logger.error("'device' or 'estimated_area' columns missing from sensor data.")
+            return None, None, None
 
-        # 5. Encode 'room_id'
-        df['room_id'] = df['estimated_room'].cat.codes
-        logger.debug("Encoded 'room_id' based on 'estimated_room'.")
+        df['device'] = df['device'].astype('category')
+        df['estimated_area'] = df['estimated_area'].astype('category')
+        area_categories = df['estimated_area'].cat.categories.tolist()
+        logger.debug("Encoded 'device' and 'estimated_area' as categorical.")
+
+        # 5. Encode 'area_id'
+        df['area_id'] = df['estimated_area'].cat.codes
+        logger.debug("Encoded 'area_id' based on 'estimated_area'.")
 
         # 6. Encode 'device_id'
         device_category_map = {device: idx for idx, device in enumerate(DEVICE_NAMES)}
@@ -1003,48 +1092,56 @@ def preprocess_data(df):
         for area in MODEL_AREAS:
             col = f"distance_to_{area}"
             if col not in df.columns:
-                df[col] = 0  # Assign a default value
-                logger.warning(f"Added missing column '{col}' with default value 0.")
+                df[col] = np.nan  # Assign NaN for missing columns
+                logger.warning(f"Added missing column '{col}' with NaN.")
         
-        # 8. Fill missing values in 'distance_to_<area>' columns with 0
-        distance_columns = [f"distance_to_{area}" for area in MODEL_AREAS]
-        df[distance_columns] = df[distance_columns].fillna(0)
-        logger.debug("Filled missing values in distance columns with 0.")
+        # 8. Replace 0s with NaN in 'distance_to_<area>' columns
+        for area in MODEL_AREAS:
+            col = f"distance_to_{area}"
+            df[col] = df[col].replace(0, np.nan)
+            logger.debug(f"Replaced 0s with NaN in column '{col}'.")
 
-        # 9. Define feature columns
+        # 9. Handle missing values with imputation
+        distance_columns = [f"distance_to_{area}" for area in MODEL_AREAS]
+        imputer = SimpleImputer(strategy='median')
+        df[distance_columns] = imputer.fit_transform(df[distance_columns])
+        logger.debug("Imputed missing values in distance columns with median.")
+
+        # 10. Define feature columns
         feature_columns = distance_columns + ['hour', 'day_of_week', 'device_id']
         
-        # 10. Check for any remaining missing values in feature columns
+        # 11. Check for any remaining missing values in feature columns
         missing_features = df[feature_columns].isnull().any()
         if missing_features.any():
             missing_cols = missing_features[missing_features].index.tolist()
             logger.error(f"Missing values detected in feature columns: {missing_cols}")
-            # Depending on your strategy, you can fill these or drop these rows
-            df[missing_cols] = df[missing_cols].fillna(0)
+            # Fill remaining missing values with median or another strategy
+            imputer = SimpleImputer(strategy='median')
+            df[missing_cols] = imputer.fit_transform(df[missing_cols])
             logger.info(f"Filled missing values in feature columns: {missing_cols}")
-        
-        # 11. Define X and y
-        X = df[feature_columns]
-        y = df['room_id']
 
-        # 12. Filter out invalid 'room_id' entries
+        # 12. Define X and y
+        X = df[feature_columns]
+        y = df['area_id']
+
+        # 13. Filter out invalid 'area_id' entries
         valid_indices = y != -1
         valid_sample_count = valid_indices.sum()
         if valid_sample_count == 0:
-            logger.error("No valid samples found after filtering 'room_id'.")
+            logger.error("No valid samples found after filtering 'area_id'.")
             return None, None, None
         X = X[valid_indices]
         y = y[valid_indices]
         logger.info(f"Preprocessed data: {len(X)} samples ready for training.")
-
-        return X, y, room_categories
+        return X, y, area_categories
     except Exception as e:
-        logger.error(f"Failed to preprocess data: {e}")
+        logger.error(f"Error in preprocess_data: {e}")
         logger.debug(traceback.format_exc())
+        # It's important to return None or appropriate values in case of failure
         return None, None, None
 
 # Function to train the model
-def train_model(X, y, room_categories):
+def train_model(X, y, area_categories):
     """
     Trains the XGBoost classifier.
     Returns the trained model.
@@ -1073,7 +1170,7 @@ def train_model(X, y, room_categories):
 
         # Evaluate the model
         y_pred = model.predict(X_test)
-        report = classification_report(y_test, y_pred, target_names=room_categories)
+        report = classification_report(y_test, y_pred, target_names=area_categories)
         logger.info(f"Classification Report:\n{report}")
 
         # Save the model
@@ -1083,207 +1180,8 @@ def train_model(X, y, room_categories):
         return model
     except Exception as e:
         logger.error(f"Failed to train model: {e}")
-        return None
-
-# Function to perform inference using the trained model
-async def perform_inference(logger, device):
-    """
-    Uses the trained model to predict the room of the device based on current sensor data.
-    Returns the predicted room if confidence is high enough, else None.
-    """
-    try:
-        if not os.path.isfile(model_file):
-            logger.error(f"Model file {model_file} not found. Inference cannot be performed.")
-            return None
-        # Load the model
-        model = joblib.load(model_file)
-        # Access shared sensor_data
-        async with sensor_data_lock:
-            current_sensor_data = sensor_data.copy()
-        # Prepare features
-        features = prepare_features(current_sensor_data, device, MODEL_AREAS)
-        # Perform prediction
-        prediction = model.predict(features)[0]
-        # Optionally, get prediction probability
-        if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(features)[0]
-            confidence = max(probabilities)
-        else:
-            confidence = 1.0  # If model doesn't support predict_proba
-        predicted_room = MODEL_AREAS[prediction] if 0 <= prediction < len(MODEL_AREAS) else None
-        if predicted_room and confidence > 0.6:  # Threshold can be adjusted
-            logger.info(f"Inference: Device {device} is in room {predicted_room} with confidence {confidence:.2f}")
-            return predicted_room
-        else:
-            logger.warning(f"Inference: Low confidence ({confidence:.2f}) for device {device}. Predicted room: {predicted_room}")
-            return None
-    except Exception as e:
-        logger.error(f"Error during inference for device {device}: {e}")
         logger.debug(traceback.format_exc())
         return None
-
-# Function to ensure critical area lighting based on presence and ambient light
-async def ensure_critical_area_lighting(logger):
-    while True:
-        current_hour = get_local_time().hour
-        is_dark = 18 <= current_hour or current_hour < 6  # Example darkness condition
-        # Access shared sensor_data
-        async with sensor_data_lock:
-            current_sensor_data = sensor_data.copy()
-        try:
-            ambient_light = float(current_sensor_data.get("sensor.curtain_light_level", 0))
-        except (ValueError, TypeError):
-            ambient_light = 0  # Default if sensor data isn't available or invalid
-
-        for area, presence_sensor in [("balcony", "sensor.balcony_presence"), ("backyard", "sensor.backyard_presence")]:
-            presence_state = current_sensor_data.get(presence_sensor, "off")
-            light_entity = f"light.{area}_lights"
-
-            if is_dark and presence_state == "on" and ambient_light < 30:  # Adjust ambient threshold as needed
-                # Fetch latest brightness and color_temp
-                brightness, color_temp = get_dynamic_brightness_and_temperature(current_sensor_data)
-                service_data = {
-                    "entity_id": light_entity,
-                    "brightness": brightness,
-                    "color_temp": color_temp
-                }
-                result = await call_service(logger, "light", "turn_on", service_data)
-                if result:
-                    logger.info(f"Ensured {light_entity} is on due to presence and low light")
-                else:
-                    logger.warning(f"Failed to ensure {light_entity} is on. Retrying or implementing fallback...")
-
-        await asyncio.sleep(60)  # Check every 60 seconds
-
-# Function to monitor room location (placeholder for actual implementation)
-async def monitor_room_location(logger, model):
-    # Schedule analyze_data as a background task
-    asyncio.create_task(analyze_data(logger))
-
-    # Start asynchronous tasks concurrently
-    asyncio.create_task(monitor_overrides(logger))
-    asyncio.create_task(ensure_critical_area_lighting(logger))
-    asyncio.create_task(monitor_automation_events(logger))
-    asyncio.create_task(monitor_light_events(logger))
-    asyncio.create_task(sensor_data_updater(logger))  # Ensure sensor_data_updater is running
-    asyncio.create_task(inference_and_handle(logger))  # Start inference loop
-
-    while True:
-        try:
-            # Access shared sensor_data
-            async with sensor_data_lock:
-                current_sensor_data = sensor_data.copy()
-            AREA_ACTIONS = get_area_actions(current_sensor_data)  # Update AREA_ACTIONS with current brightness/color_temp
-
-            # Here, you can implement additional logic if needed, such as periodic predictions
-            # For example, you can trigger predictions at regular intervals instead of on every event
-
-            await asyncio.sleep(1)  # Short delay to prevent tight loop
-        except Exception as e:
-            logger.error(f"Unexpected error in monitor_room_location: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(10)  # Prevent tight loop in case of continuous errors
-
-# Function to perform inference and handle room changes
-async def inference_and_handle(logger):
-    """
-    Periodically performs inference for all devices and handles room changes.
-    """
-    while True:
-        try:
-            async with sensor_data_lock:
-                devices = [device for device in DEVICE_NAMES]
-            AREA_ACTIONS = get_area_actions(sensor_data.copy())
-            for device in devices:
-                room = await perform_inference(logger, device)
-                if room:
-                    await handle_room_change(logger, device, room, "enter", AREA_ACTIONS, user="inference")
-            await asyncio.sleep(60)  # Perform inference every 60 seconds
-        except Exception as e:
-            logger.error(f"Error in inference_and_handle: {e}")
-            logger.debug(traceback.format_exc())
-            await asyncio.sleep(60)
-
-# Health server implementation using aiohttp
-async def health(request):
-    return web.Response(text="OK")
-
-async def start_health_server(logger):
-    app = web.Application()
-    app.router.add_get('/health', health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8000)
-    await site.start()
-    logger.info("Health server started on port 8000")
-
-# Main application logic
-async def main():
-    # Initialize asynchronous logger
-    logger = logging.getLogger('ai_agent')
-    logger.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs during testing
-
-    # Create and add file handler
-    file_handler = logging.FileHandler(ai_agent_log_file)
-    file_handler.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
-    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(file_formatter)
-    logger.addHandler(file_handler)
-
-    # Create and add stream handler (logs to STDOUT)
-    stream_handler = logging.StreamHandler()
-    stream_handler.setLevel(logging.DEBUG)  # Set to DEBUG for detailed logs
-    stream_formatter = logging.Formatter('%(name)s - %(levelname)s - %(message)s')
-    stream_handler.setFormatter(stream_formatter)
-    logger.addHandler(stream_handler)
-
-    # Initialize CSV file
-    initialize_csv(logger)
-
-    # Load and preprocess data
-    try:
-        logger.info("Loading and preprocessing data...")
-        # Load data
-        df = await asyncio.to_thread(load_data)
-        if df is None:
-            logger.error("Data loading failed. Exiting.")
-            return
-
-        # Preprocess data
-        X, y, room_categories = await asyncio.to_thread(preprocess_data, df)
-        if X is None or y is None or room_categories is None:
-            logger.error("Preprocessing failed. Exiting.")
-            return
-
-        # Train the model
-        logger.info("Training the model...")
-        model = await asyncio.to_thread(train_model, X, y, room_categories)
-        if model is None:
-            logger.error("Model training failed. Exiting.")
-            return
-
-        logger.info("Model training completed.")
-    except Exception as e:
-        logger.error(f"Error during data loading and model training: {e}")
-        logger.debug(traceback.format_exc())
-        return
-
-    try:
-        # Start health server
-        asyncio.create_task(start_health_server(logger))
-
-        # Start monitoring room location
-        asyncio.create_task(monitor_room_location(logger, model))
-
-        logger.info("AI agent is running...")
-    except Exception as e:
-        logger.error(f"Error starting AI agent tasks: {e}")
-        logger.debug(traceback.format_exc())
-        return
-
-    # Keep the main coroutine running
-    while True:
-        await asyncio.sleep(3600)  # Sleep for an hour, adjust as needed
 
 # Run the main coroutine
 if __name__ == "__main__":
